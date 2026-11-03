@@ -28,20 +28,28 @@ type Verbose struct {
 
 func V(level Level) Verbose { return Verbose{level: level} }
 
-func (v Verbose) PrintDepth(_ int, args ...interface{}) {
-	if h := handler.Load(); h != nil {
-		h.write(int(v.level), fmt.Sprint(args...))
-	} else if v.level <= 0 {
-		log.Print(args...)
+// PrintLazy formats a message only when its level is enabled. One handler
+// snapshot governs both formatting and delivery, even if SetHandler runs during
+// formatting. The formatter runs synchronously and is never retained.
+func (v Verbose) PrintLazy(message func() string) {
+	h := handler.Load()
+	if h == nil && v.level > 0 {
+		return
+	}
+	text := message()
+	if h != nil {
+		h.write(int(v.level), text)
+	} else {
+		log.Print(text)
 	}
 }
 
+func (v Verbose) PrintDepth(_ int, args ...interface{}) {
+	v.PrintLazy(func() string { return fmt.Sprint(args...) })
+}
+
 func (v Verbose) PrintfDepth(_ int, format string, args ...interface{}) {
-	if h := handler.Load(); h != nil {
-		h.write(int(v.level), fmt.Sprintf(format, args...))
-	} else if v.level <= 0 {
-		log.Printf(format, args...)
-	}
+	v.PrintLazy(func() string { return fmt.Sprintf(format, args...) })
 }
 
 func Warningf(format string, args ...interface{}) {

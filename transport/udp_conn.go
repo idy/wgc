@@ -16,11 +16,17 @@ func FromUDPConn(uc *net.UDPConn) *UDPConn {
 }
 
 func (uc *UDPConn) ReadFrom(b []byte) (int, netip.AddrPort, error) {
-	n, ap, err := uc.uc.ReadFromUDPAddrPort(b)
-	if err != nil {
-		return 0, netip.AddrPort{}, err
+	for {
+		n, ap, err := uc.uc.ReadFromUDPAddrPort(b)
+		if isDatagramTooLarge(err) {
+			// Windows consumes the datagram but reports a truncated payload.
+			continue
+		}
+		if err != nil {
+			return 0, netip.AddrPort{}, err
+		}
+		return n, netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), nil
 	}
-	return n, netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), nil
 }
 
 func (uc *UDPConn) WriteTo(b []byte, addr netip.AddrPort) (int, error) {

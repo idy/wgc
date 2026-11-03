@@ -30,9 +30,10 @@ const (
 )
 
 var (
-	ErrPeerNotFound  = errors.New("netutils/wireguard: peer not found")
-	ErrPeerBlocked   = errors.New("netutils/wireguard: peer blocked")
-	ErrPeerNoSession = errors.New("netutils/wireguard: peer has no session")
+	ErrPeerNotFound    = errors.New("netutils/wireguard: peer not found")
+	ErrPeerBlocked     = errors.New("netutils/wireguard: peer blocked")
+	ErrPeerNoSession   = errors.New("netutils/wireguard: peer has no session")
+	ErrMessageTooLarge = errors.New("netutils/wireguard: message exceeds MaximumDataSize")
 
 	errInvalidPacket = fmt.Errorf("netutils/wireguard: %w", netutils.ErrInvalidPacket)
 	errConnClosed    = fmt.Errorf("netutils/wireguard: %w", net.ErrClosed)
@@ -83,7 +84,9 @@ func (w *PeerWriter) Peer() (Peer, bool) {
 }
 
 func (w *PeerWriter) Close() error {
-	w.sendQueue.Close()
+	if w.sendQueue != nil {
+		w.sendQueue.Close()
+	}
 	return nil
 }
 
@@ -240,10 +243,14 @@ type Conn struct {
 	mu sync.RWMutex
 	// +checklocks:mu
 	closed bool
+	// +checklocks:mu
+	readErr error
+	done    chan struct{}
 
 	sessionStore sync.Map
 	peerStore    sync.Map
 	peerWriters  sync.Map
+	autoWriters  sync.Map
 	peerCount    atomic.Int64
 	maxPeers     int64
 	sharedWrite  *sendQueue
@@ -286,14 +293,16 @@ func NewConn(transport Transport, config Config) (*Conn, error) {
 
 		peerConfigLookup: config.PeerConfigLookup,
 		maxPeers:         int64(config.MaxPeers),
+		done:             make(chan struct{}),
+		statsResetTime:   time.Now(),
 	}
 	conn.stats.disabled = config.DisableStats
 	conn.stats.TxStats.disabled = config.DisableStats
-	conn.readQueue = streamRead(conn, config.readQueueSize())
 	conn.writeQueue = newWriteQueue(config.writeQueueSize())
 	if config.SharedWriteQueue {
 		conn.sharedWrite = conn.writeQueue.newSendQueue(config.writeQueueSize())
 	}
+	conn.readQueue = streamRead(conn, config.readQueueSize())
 	return conn, nil
 }
 
@@ -307,11 +316,12 @@ type Stats struct {
 // CaptureStats captures the status of the current connection, returns the
 // status and the start time of the status counter. After calling this function,
 // the status counter will be reset and the current time will be set as the
-// start time of a new round of counter. The new connection will set the counter
-// start time when ReadFrom is called for the first time.
+// start time of a new round of counter. The first interval starts when the
+// connection is constructed.
 func (conn *Conn) CaptureStats() (Stats, time.Time) {
 	conn.stats.Lock()
 	defer conn.stats.Unlock()
+	start := conn.statsResetTime
 	s := Stats{
 		ConnStats: conn.stats.ConnStats,
 		TxStats:   conn.stats.TxStats,
@@ -319,7 +329,9 @@ func (conn *Conn) CaptureStats() (Stats, time.Time) {
 	}
 	conn.stats.peers.Range(func(k, v interface{}) bool {
 		ps := v.(*PeerStats)
-		s.Peers[k.(Key)] = *ps
+		snapshot := *ps
+		snapshot.peerPtr = nil
+		s.Peers[k.(Key)] = snapshot
 		if atomic.LoadPointer(&ps.peerPtr) == nil {
 			conn.stats.peers.Delete(k)
 		} else {
@@ -330,7 +342,7 @@ func (conn *Conn) CaptureStats() (Stats, time.Time) {
 	conn.stats.ConnStats = ConnStats{}
 	conn.stats.TxStats = TxStats{disabled: conn.stats.disabled}
 	conn.statsResetTime = time.Now()
-	return s, conn.statsResetTime
+	return s, start
 }
 
 // Close closes the underlying udp socket immediately, unblock all pending
@@ -347,25 +359,28 @@ func (conn *Conn) Close() error {
 		return nil
 	}
 	conn.closed = true
+	close(conn.done)
+	conn.writeQueue.Close()
 
 	conn.logV(3).Print("WireGuard closing...")
 	defer conn.logV(3).Print("WireGuard closed")
 
-	peers := make([]*peer, 0)
 	conn.peerStore.Range(func(_, v interface{}) bool {
-		peers = append(peers, v.(*peer))
+		conn.evictPeerLocked(v.(*peer))
 		return true
 	})
-	for _, p := range peers {
-		conn.evictPeerLocked(p)
-	}
 
-	conn.writeQueue.Close()
 	if conn.sharedWrite != nil {
 		conn.sharedWrite.Close()
 	}
-	conn.peerWriters.Range(func(_, v interface{}) bool {
+	conn.peerWriters.Range(func(k, v interface{}) bool {
 		v.(*PeerWriter).Close()
+		conn.peerWriters.Delete(k)
+		return true
+	})
+	conn.autoWriters.Range(func(k, v interface{}) bool {
+		v.(*sendQueue).Close()
+		conn.autoWriters.Delete(k)
 		return true
 	})
 
@@ -374,6 +389,15 @@ func (conn *Conn) Close() error {
 		return true
 	})
 	return conn.transport.Close()
+}
+
+func (conn *Conn) closeWithReadError(err error) {
+	conn.mu.Lock()
+	if !conn.closed && conn.readErr == nil {
+		conn.readErr = err
+	}
+	conn.mu.Unlock()
+	conn.Close()
 }
 
 // PublicKey returns a clone version of the static public key of the WireGuard
@@ -393,18 +417,41 @@ func (conn *Conn) PrivateKey() Key {
 // admission, not transmission or delivery. Encryption and sending happen in the
 // background; a message can trigger a handshake and be discarded while no
 // session is available. Applications must implement retries or acknowledgements
-// when delivery matters.
+// when delivery matters. A peer evicted during admission returns ErrPeerBlocked;
+// the connection remains usable and the application may retry with a new peer.
 func (conn *Conn) WriteTo(b []byte, staticPubKey Key) (int, Peer, error) {
-	if conn.sharedWrite != nil {
-		p, ok := conn.peer(staticPubKey)
-		if !ok {
-			return 0, nil, ErrPeerNotFound
-		}
-		n, err := conn.sharedWrite.enqueueChunks([][]byte{b}, p)
-		return n, p, err
+	p, ok := conn.peer(staticPubKey)
+	if !ok {
+		return 0, nil, ErrPeerNotFound
 	}
-	w := conn.PeerWriter(staticPubKey)
-	return w.WriteToPeer(b)
+	queue := conn.sharedWrite
+	if queue == nil {
+		if value, loaded := conn.autoWriters.Load(p); loaded {
+			queue = value.(*sendQueue)
+		} else {
+			conn.mu.Lock()
+			if conn.closed {
+				conn.mu.Unlock()
+				return 0, nil, errConnClosed
+			}
+			if p.evicted.AtomicRead() {
+				conn.mu.Unlock()
+				return 0, nil, ErrPeerBlocked
+			}
+			if value, loaded := conn.autoWriters.Load(p); loaded {
+				queue = value.(*sendQueue)
+			} else {
+				queue = conn.writeQueue.newSendQueue(cap(conn.writeQueue.sealQueue))
+				conn.autoWriters.Store(p, queue)
+			}
+			conn.mu.Unlock()
+		}
+	}
+	n, err := queue.enqueueChunks([][]byte{b}, p)
+	if err != nil {
+		return 0, nil, &ioError{Op: "write", Err: err, Peer: p.staticPub}
+	}
+	return n, p, nil
 }
 
 // ReadQueue returns a channel that contains all packets received by the
@@ -422,6 +469,12 @@ func (conn *Conn) ReadQueue() <-chan Packet {
 func (conn *Conn) ReadFrom(b []byte) (int, Peer, error) {
 	pkt, ok := <-conn.readQueue
 	if !ok {
+		conn.mu.RLock()
+		err := conn.readErr
+		conn.mu.RUnlock()
+		if err != nil {
+			return 0, nil, err
+		}
 		return 0, nil, errConnClosed
 	}
 	defer pkt.Release()
@@ -440,8 +493,17 @@ func (conn *Conn) handleInboundMessage(msg *inboundMessage) ([]byte, error) {
 		conn.stats.RUnlock()
 		return nil, errInvalidPacket
 	}
-	conn.updateStateAfterRecv(msg, data)
+	accepted := conn.updateStateAfterRecv(msg, data)
 	conn.stats.RUnlock()
+	if !accepted {
+		if msg.typ == header.Initiation && msg.session != nil {
+			conn.deleteSession(msg.session)
+		}
+		return nil, errInvalidPacket
+	}
+	if msg.typ == header.Response && msg.session != nil {
+		go msg.session.peer.writeImmediately(nil)
+	}
 
 	switch msg.typ {
 	default:
@@ -498,33 +560,42 @@ func (conn *Conn) PeerWriter(peerPubKey Key) *PeerWriter {
 		pk:   peerPubKey,
 		conn: conn,
 	}
-	conn.peerWriters.Store(peerPubKey, pw)
-	if conn.closed {
-		// if connection is closed, the write queue is never used.
-		return pw
+	if !conn.closed {
+		pw.sendQueue = conn.writeQueue.newSendQueue(cap(conn.writeQueue.sealQueue))
+		conn.peerWriters.Store(peerPubKey, pw)
 	}
-	pw.sendQueue = conn.writeQueue.newSendQueue(1 << 10)
 	return pw
 }
 
-func (conn *Conn) updateStateAfterRecv(msg *inboundMessage, data []byte) {
+func (conn *Conn) updateStateAfterRecv(msg *inboundMessage, data []byte) bool {
 	// This message is not requires any authentication, e.g. we send a cookie
 	// reply for handshake initiation/response.
 	if msg.session == nil {
-		return
+		return true
+	}
+	select {
+	case <-conn.done:
+		return false
+	default:
 	}
 
 	peer := msg.session.peer
 	peer.Lock()
 	defer peer.Unlock()
 
-	if peer.blocked.Read() {
-		return
+	if peer.blocked.Read() || peer.evicted.AtomicRead() {
+		return false
+	}
+	if msg.typ == header.Response && peer.handshake != msg.session {
+		return false
+	}
+	if msg.typ == header.Initiation && !peer.handshakeTimestampFilter.isCurrent(&msg.initiationTime) {
+		return false
 	}
 	// If any events starts, we start the set zero timer.
 	peer.startSetZeroTimer()
 
-	if !peer.addrRoamingDisabled {
+	if msg.typ != header.CookieReply && !peer.addrRoamingDisabled {
 		// Peer address roaming
 		if peer.compareAndSetAddrUpdated(msg.time) {
 			msg.logV(3).Printf("Peer roaming: %v->%v", peer.addr, msg.addr)
@@ -555,10 +626,6 @@ func (conn *Conn) updateStateAfterRecv(msg *inboundMessage, data []byte) {
 		peer.setNextSession(msg.session)
 		msg.logV(3).Print("Next session is waiting for transport data message")
 	case header.Response:
-		if peer.handshake != msg.session {
-			msg.logV(0).Print("handshake session not match")
-			panic("panic")
-		}
 		peer.compareAndSetHandshakeRecv(msg.time)
 		peer.rotateHandshakeSessionToCurrent()
 		msg.logV(3).Print("Handshake complete, rotate to current")
@@ -584,27 +651,26 @@ func (conn *Conn) updateStateAfterRecv(msg *inboundMessage, data []byte) {
 			age := msg.time.Sub(st.establishTime)
 			if !peer.handshakeInitiationDisabled && st.isInitiator && age > rejectAfterTime-rekeyTimeout-keepaliveTimeout {
 				msg.logV(3).Print("Current session is outdating, try to initiate a handshake")
-				go peer.InitiateHandshake()
+				peer.requestHandshakeLocked()
 			}
 		}
 	}
+	return true
 }
 
 func (conn *Conn) updateStateBeforeDataSent(w *peerWriter) (blocked bool, current *secureSession, addr netip.AddrPort) {
 	w.peer.Lock()
 	defer w.peer.Unlock()
 
-	if w.peer.blocked.Read() {
-		return
+	if w.peer.blocked.Read() || w.peer.evicted.AtomicRead() {
+		return true, nil, netip.AddrPort{}
 	}
 	if !w.isKeepalive() {
 		w.peer.compareAndSetDataWillSend(w.start)
 	}
 	if w.peer.current == nil {
 		w.logV(3).Print("First writing, try to initiate a handshake")
-		if !w.peer.handshakeInitiationDisabled {
-			go w.peer.InitiateHandshake()
-		}
+		w.peer.requestHandshakeLocked()
 		return w.peer.blocked.Read(), w.peer.current, w.peer.addr
 	}
 	st := w.peer.current.Snapshot()
@@ -614,14 +680,10 @@ func (conn *Conn) updateStateBeforeDataSent(w *peerWriter) (blocked bool, curren
 	case st.sendCount > rejectAfterMessages || age > rejectAfterTime:
 		w.logV(3).Print("Current session is outdated, evict and try to initate a handshake")
 		w.peer.evictCurrentSession()
-		if !w.peer.handshakeInitiationDisabled {
-			go w.peer.InitiateHandshake()
-		}
+		w.peer.requestHandshakeLocked()
 	case st.sendCount > rekeyAfterMessages || st.isInitiator && age > rekeyAfterTime:
 		w.logV(3).Print("Current session is outdating, try to initate a handshake")
-		if !w.peer.handshakeInitiationDisabled {
-			go w.peer.InitiateHandshake()
-		}
+		w.peer.requestHandshakeLocked()
 	}
 	return w.peer.blocked.Read(), w.peer.current, w.peer.addr
 }
@@ -719,7 +781,7 @@ func (conn *Conn) saveSessionLocked(s *secureSession) error {
 func (conn *Conn) deleteSession(s *secureSession) bool {
 	conn.mu.RLock()
 	defer conn.mu.RUnlock()
-	_, loaded := conn.sessionStore.LoadAndDelete(s.sender)
+	loaded := conn.sessionStore.CompareAndDelete(s.sender, s)
 	if loaded {
 		conn.stats.SessionDeleted()
 	}
@@ -729,7 +791,7 @@ func (conn *Conn) deleteSession(s *secureSession) bool {
 // +checklocksread:conn.mu
 // +checklocksread:conn.stats.mu
 func (conn *Conn) deleteSessionLocked(s *secureSession) bool {
-	_, loaded := conn.sessionStore.LoadAndDelete(s.sender)
+	loaded := conn.sessionStore.CompareAndDelete(s.sender, s)
 	if loaded {
 		conn.stats.sessionDeletedLocked()
 	}
@@ -792,7 +854,9 @@ func (conn *Conn) peer(peerPubKey Key) (*peer, bool) {
 		p.addr = pi.Addr
 	}
 
-	// Lock peer to ensure p.stats is not nil when peer is accessed.
+	// Publish the live statistics marker before capture can inspect the entry.
+	conn.stats.RLock()
+	defer conn.stats.RUnlock()
 	p.Lock()
 	peer, peerExisted := conn.loadOrStorePeer(peerPubKey, p)
 	if peerExisted {
@@ -805,11 +869,9 @@ func (conn *Conn) peer(peerPubKey Key) (*peer, bool) {
 	p.stats = ps
 	p.Unlock()
 
-	conn.stats.RLock()
 	if !conn.stats.disabled {
-		atomic.AddUint64(&conn.stats.PeersJoin, 1)
+		addStatCounter(&conn.stats.PeersJoin, 1)
 	}
-	conn.stats.RUnlock()
 
 	return p, true
 }
@@ -837,13 +899,12 @@ func (conn *Conn) evictPeer(p *peer) bool {
 // +checklocksread:conn.mu
 // +checklocksread:conn.stats.mu
 func (conn *Conn) evictPeerLocked(p *peer) bool {
-	_, loaded := conn.peerStore.LoadAndDelete(*p.staticPub)
-	if !loaded {
+	if !conn.peerStore.CompareAndDelete(*p.staticPub, p) {
 		return false
 	}
 	conn.peerCount.Add(-1)
 	if !conn.stats.disabled {
-		atomic.AddUint64(&conn.stats.PeersEvict, 1)
+		addStatCounter(&conn.stats.PeersEvict, 1)
 	}
 	// After the Peer has been deleted from the peerStore, due to concurrency,
 	// the new Peer may be stored in the peerStore. Therefore, when clearing
@@ -855,10 +916,9 @@ func (conn *Conn) evictPeerLocked(p *peer) bool {
 	for _, s := range ss {
 		conn.deleteSessionLocked(s)
 	}
-	p.evicted.SetTrue()
-	// blocked is also read non-atomically while holding peer.mu. Eviction
-	// must use the same lock as Block/Unblock and the packet workers.
-	p.Block()
+	if value, loaded := conn.autoWriters.LoadAndDelete(p); loaded {
+		value.(*sendQueue).Close()
+	}
 	return true
 }
 

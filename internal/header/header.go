@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/idy/wgc/internal/tai64"
@@ -81,18 +80,7 @@ func (k *Key) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return err
 	}
-	n := base64.StdEncoding.DecodedLen(len(s))
-	if n < KeySize {
-		return errors.New("short key")
-	} else if n > KeySize+1 {
-		return errors.New("key is too long")
-	}
-	t, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return fmt.Errorf("decode key: %v: %w", s, err)
-	}
-	*k = *(*Key)(t)
-	return nil
+	return k.UnmarshalText([]byte(s))
 }
 
 func (k Key) MarshalText() ([]byte, error) {
@@ -100,18 +88,14 @@ func (k Key) MarshalText() ([]byte, error) {
 }
 
 func (k *Key) UnmarshalText(text []byte) error {
-	n := base64.StdEncoding.DecodedLen(len(text))
-	if n < KeySize {
-		return errors.New("short key")
-	} else if n > KeySize+1 {
-		return errors.New("key is too long")
-	}
-	var t Key
-	_, err := base64.StdEncoding.Decode(t[:], text)
+	decoded, err := base64.StdEncoding.DecodeString(string(text))
 	if err != nil {
-		return err
+		return fmt.Errorf("decode key: %w", err)
 	}
-	*k = t
+	if len(decoded) != KeySize {
+		return fmt.Errorf("invalid key length: got %d bytes, want %d", len(decoded), KeySize)
+	}
+	copy(k[:], decoded)
 	return nil
 }
 

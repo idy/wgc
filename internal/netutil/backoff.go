@@ -45,7 +45,7 @@ func (b *Backoff) Backoff() time.Duration {
 		b.tempDelay *= 2
 	}
 	if b.tempDelay > b.maxDelay() {
-		b.tempDelay = b.MaxDelay
+		b.tempDelay = b.maxDelay()
 	}
 	return b.tempDelay + TimeJitter()
 }

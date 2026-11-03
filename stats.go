@@ -63,22 +63,55 @@ type TxStats struct {
 	}
 }
 
-// recvPacket does not need to support concurrency, because the ReadFrom
-// function does not support concurrency.
+var statCounterMu sync.Mutex
+
+// Primitive 64-bit atomics require alignment that ordinary counters do not
+// have on 32-bit systems. The enclosing statistics lock still protects captures.
+func addStatCounter(counter *uint64, delta uint64) {
+	if unsafe.Alignof(uint64(0)) < 8 {
+		statCounterMu.Lock()
+		*counter += delta
+		statCounterMu.Unlock()
+		return
+	}
+	atomic.AddUint64(counter, delta)
+}
+
+// addPacketStatCounters updates one packet's counters under a single lock on
+// 32-bit systems, retaining atomic updates on systems with 64-bit alignment.
+func addPacketStatCounters(bytes, packets, handshake *uint64, n uint64) {
+	if unsafe.Alignof(uint64(0)) < 8 {
+		statCounterMu.Lock()
+		*bytes += n
+		*packets += 1
+		if handshake != nil {
+			*handshake += 1
+		}
+		statCounterMu.Unlock()
+		return
+	}
+	atomic.AddUint64(bytes, n)
+	atomic.AddUint64(packets, 1)
+	if handshake != nil {
+		atomic.AddUint64(handshake, 1)
+	}
+}
+
+// Receive counters are updated by parallel decryption workers.
 func (s *TxStats) recvPacket(n int, typ header.MessageType) {
 	if s.disabled {
 		return
 	}
-	s.BytesRecv += uint64(n)
-	s.PacketsRecv += 1
+	var handshake *uint64
 	switch typ {
 	case header.Initiation:
-		s.Handshake.InitiationsRecv += 1
+		handshake = &s.Handshake.InitiationsRecv
 	case header.Response:
-		s.Handshake.ResponsesRecv += 1
+		handshake = &s.Handshake.ResponsesRecv
 	case header.CookieReply:
-		s.Handshake.CookiesRecv += 1
+		handshake = &s.Handshake.CookiesRecv
 	}
+	addPacketStatCounters(&s.BytesRecv, &s.PacketsRecv, handshake, uint64(n))
 }
 
 // sendPacket needs to support concurrency because Peer.Write supports
@@ -87,16 +120,16 @@ func (s *TxStats) sendPacket(n int, typ header.MessageType) {
 	if s.disabled {
 		return
 	}
-	atomic.AddUint64(&s.BytesSent, uint64(n))
-	atomic.AddUint64(&s.PacketsSent, 1)
+	var handshake *uint64
 	switch typ {
 	case header.Initiation:
-		atomic.AddUint64(&s.Handshake.InitiationsSent, 1)
+		handshake = &s.Handshake.InitiationsSent
 	case header.Response:
-		atomic.AddUint64(&s.Handshake.ResponsesSent, 1)
+		handshake = &s.Handshake.ResponsesSent
 	case header.CookieReply:
-		atomic.AddUint64(&s.Handshake.CookiesSent, 1)
+		handshake = &s.Handshake.CookiesSent
 	}
+	addPacketStatCounters(&s.BytesSent, &s.PacketsSent, handshake, uint64(n))
 }
 
 type statsCounter struct {
@@ -155,21 +188,19 @@ func (cnt *statsCounter) SessionCreated() {
 // +checklocksread:cnt.mu
 func (cnt *statsCounter) sessionCreatedLocked() {
 	if !cnt.disabled {
-		atomic.AddUint64(&cnt.SessionsCreate, 1)
+		addStatCounter(&cnt.SessionsCreate, 1)
 	}
 }
 
 func (cnt *statsCounter) SessionDeleted() {
 	cnt.RLock()
 	defer cnt.RUnlock()
-	if !cnt.disabled {
-		atomic.AddUint64(&cnt.SessionsDelete, 1)
-	}
+	cnt.sessionDeletedLocked()
 }
 
 // +checklocksread:cnt.mu
 func (cnt *statsCounter) sessionDeletedLocked() {
 	if !cnt.disabled {
-		atomic.AddUint64(&cnt.SessionsDelete, 1)
+		addStatCounter(&cnt.SessionsDelete, 1)
 	}
 }

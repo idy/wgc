@@ -48,18 +48,15 @@ func (hr *handshakeResponse) Open() ([]byte, bool) {
 	hr.session = s
 
 	st := s.Snapshot()
-	if st.state != initiated {
-		hr.logV(3).Printf("Invalid session state: %v", st.state)
+	if st.state != initiated || st.hash == nil || st.chainKey == nil || st.ephemeralPriv == nil {
+		hr.logV(3).Print("Handshake is not initialized or is already complete")
 		return nil, false
 	}
 	h, ck := *st.hash, *st.chainKey
 	hh := newHandshakeHelper(&h, &ck)
-	s.RLock()
-	epk := s.ephemeralPriv
-	s.RUnlock()
 	err := hh.ParseHandshakeResponse(
 		m,
-		epk,
+		st.ephemeralPriv,
 		hr.conn.staticPriv,
 		s.peer.psk.AtomicRead(),
 	)
@@ -81,16 +78,16 @@ func (hr *handshakeResponse) Open() ([]byte, bool) {
 
 	s.Lock()
 	defer s.Unlock()
-	if s := s.state(); s != initiated {
-		hr.logV(3).Printf("Invalid session state: %v", s)
+	// A retransmission can publish a new handshake generation while this
+	// response is being authenticated. Commit only the generation we opened.
+	if s.state() != initiated || s.hash != st.hash || s.chainKey != st.chainKey || s.ephemeralPriv != st.ephemeralPriv {
+		hr.logV(3).Print("Handshake was completed or retransmitted while opening the response")
 		return nil, false
 	}
 	s.receiver = m.Sender()
 	s.hash = &h
-	s.peerEphemeralPub = nil
 	s.chainKey = nil
 	s.ephemeralPriv = nil
-	s.ephemeralPub = nil
 	s.recvCipher = rc
 	s.sendCipher = sc
 	s.establishTime = hr.time

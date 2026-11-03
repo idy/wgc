@@ -1,7 +1,6 @@
 package wireguard
 
 import (
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"time"
@@ -22,19 +21,15 @@ func KeyFromHex(s string) (k Key, err error) {
 	if err != nil {
 		return
 	}
+	if len(b) != KeySize {
+		return k, fmt.Errorf("invalid key length: got %d bytes, want %d", len(b), KeySize)
+	}
 	copy(k[:], b)
 	return
 }
 
 func KeyFromBase64(s string) (k Key, err error) {
-	b, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return
-	}
-	if len(b) != KeySize {
-		return k, fmt.Errorf("invalid key length: got %d bytes, want %d", len(b), KeySize)
-	}
-	copy(k[:], b)
+	err = k.UnmarshalText([]byte(s))
 	return
 }
 

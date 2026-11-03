@@ -85,7 +85,9 @@ application acknowledgements and retries when delivery matters, as the echo
 example does. `PeerWriter` provides a reusable writer for a selected peer.
 The API is message-oriented and does not implement `net.Conn` or `net.PacketConn`
 directly; it does not guarantee delivery or ordering. Keep a read loop running,
-since WireGuard keepalives can appear as empty messages.
+since WireGuard keepalives can appear as empty messages. Messages larger than
+`MaximumDataSize`, including the combined size of a chunked write, return
+`ErrMessageTooLarge` before entering a queue.
 
 For a receive queue, range over `conn.ReadQueue()` and call `packet.Release()`
 after consuming each packet. Packet bytes are pooled; copy them before retaining
@@ -102,9 +104,11 @@ them beyond `Release`. Do not combine queue reads and `ReadFrom` on one connecti
   behavior; set a limit for listeners exposed to untrusted peers.
 - `ReadQueueSize` and `WriteQueueSize` default to 1024.
 - `SharedWriteQueue` shares the connection's write queue across destinations.
-  Explicit `PeerWriter` values retain their own queues.
+  Otherwise, `WriteTo` queues belong to admitted peers and retire on eviction.
+  Explicit `PeerWriter` values retain their own queues across peer eviction.
 - `DisableStats` disables peer history and traffic counters. Otherwise,
-  `CaptureStats` captures and resets the counters.
+  `CaptureStats` captures and resets the counters, returning the captured
+  interval's start time.
 - `Close` closes the underlying transport and unblocks pending I/O.
 
 ## Transports
@@ -151,9 +155,17 @@ go vet ./...
 go run ./examples/echo
 ```
 
+Public integration, regression, and benchmark suites live under [`tests/`](tests/README.md).
+Run a suite with `go test -race ./tests/integration/...` or
+`go test -race ./tests/regression/...`, and run public benchmarks with
+`go test -run '^$' -bench . -benchmem ./tests/benchmark/...`.
+White-box tests and microbenchmarks stay beside the Go packages whose private
+state they exercise. The full `go test ./...` commands discover all test packages;
+benchmarks run when `-bench` is specified.
+
 Tests cover handshake helpers, bounded peer state, concurrent shutdown,
-authenticated transport messages, replay rejection, UDP I/O, and transport
-shutdown. `BUFPOOL_MINI` selects a smaller standard-library buffer pool;
+authenticated transport messages, replay rejection, real encrypted UDP echoes,
+and transport shutdown. `BUFPOOL_MINI` selects a smaller standard-library buffer pool;
 the default pool uses gVisor's buffer implementation. This is the existing pool
 behavior, and the build tag changes `MaximumMessageSize` and `MaximumDataSize`.
 
@@ -166,6 +178,7 @@ Key files:
 - `internal/`: protocol headers, cryptographic helpers, buffers, timestamps,
   backoff, and logging.
 - `examples/echo/`: a self-contained local exchange.
+- `tests/`: public integration tests, regressions, benchmarks, and shared fixtures.
 - `site/`: the static project page, published to `wgc.idy.dev` by GitHub Pages.
 
 ## License

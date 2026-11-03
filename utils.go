@@ -1,7 +1,6 @@
 package wireguard
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"net/netip"
 	"strings"
@@ -30,27 +29,28 @@ func (f *timestampFilter) Unlock() {
 	f.mu.Unlock()
 }
 
-func (f *timestampFilter) after(t *tai64.NanoTime) bool {
-	l := f.t.Load()
-	if l == nil {
-		return false
-	}
-	s := f.t.Load().(*tai64.NanoTime)
-	return s.After(t)
+func (f *timestampFilter) atOrAfter(t *tai64.NanoTime) bool {
+	latest := f.t.Load()
+	return latest != nil && !t.After(latest.(*tai64.NanoTime))
 }
 
 func (f *timestampFilter) Filter(t *tai64.NanoTime) bool {
-	if f.after(t) {
+	if f.atOrAfter(t) {
 		return false
 	}
 	f.Lock()
 	defer f.Unlock()
-	if f.after(t) {
+	if f.atOrAfter(t) {
 		return false
 	}
 	v := *t
 	f.t.Store(&v)
 	return true
+}
+
+func (f *timestampFilter) isCurrent(t *tai64.NanoTime) bool {
+	latest := f.t.Load()
+	return latest != nil && t.Equal(latest.(*tai64.NanoTime))
 }
 
 func maxTime(ts []time.Time) time.Time {
@@ -69,12 +69,6 @@ func compareAndAssignTime(a *time.Time, b time.Time) bool {
 		return true
 	}
 	return false
-}
-
-func randomJitter() time.Duration {
-	var v uint16
-	binary.Read(rand.Reader, binary.LittleEndian, &v)
-	return time.Duration(int64(v)%334) * time.Millisecond
 }
 
 func addrToBytes(dst []byte, addr netip.AddrPort) []byte {

@@ -134,8 +134,6 @@ func (h *handshakeHelper) ParseHandshakeInitiation(
 
 func (h *handshakeHelper) SetEmpty(
 	msg header.HandshakeResponseMessage,
-	staticPriv *Key,
-	staticPub *Key,
 	ephemeralPriv *Key,
 	ephemeralPub *Key,
 	peerStaticPub *Key,

@@ -76,7 +76,20 @@ func streamRead(conn *Conn, size int) <-chan Packet {
 				pkt.Release()
 				continue
 			}
-			dataQueue <- pkt
+			select {
+			case dataQueue <- pkt:
+			case <-conn.done:
+				pkt.Release()
+			}
+		}
+		// Reception has stopped; return unread buffers still owned by the queue.
+		for {
+			select {
+			case pkt := <-dataQueue:
+				pkt.Release()
+			default:
+				return
+			}
 		}
 	}()
 	for i := 0; i < runtime.NumCPU(); i++ {
@@ -91,28 +104,39 @@ func streamRead(conn *Conn, size int) <-chan Packet {
 	}
 	go func() {
 		elem := newReadQueueElem(conn)
+		var timer *time.Timer
 		defer func() {
+			if timer != nil {
+				timer.Stop()
+			}
 			close(deliveryQueue)
 			close(openQueue)
-
-			// If msg is delivered, it will be put back to the pool by the
-			// receiver. If code reaches here, it means the msg is not
-			// delivered, so we need to put it back.
-			elem.Release()
+			if elem != nil {
+				elem.Release()
+			}
 		}()
 		var backoff netutils.Backoff
 		for {
 			if err := elem.msg.Read(); err != nil {
-				conn.mu.RLock()
-				closed := conn.closed
-				conn.mu.RUnlock()
-				if closed {
+				select {
+				case <-conn.done:
 					return
+				default:
 				}
 				if delay, ok := backoff.ErrBackoff(err); ok {
-					time.Sleep(delay)
+					if timer == nil {
+						timer = time.NewTimer(delay)
+					} else {
+						timer.Reset(delay)
+					}
+					select {
+					case <-timer.C:
+					case <-conn.done:
+						return
+					}
 					continue
 				}
+				conn.closeWithReadError(err)
 				return
 			}
 			backoff.Reset()
@@ -120,8 +144,18 @@ func streamRead(conn *Conn, size int) <-chan Packet {
 			elem.Lock()
 			select {
 			case deliveryQueue <- elem:
-				openQueue <- elem
-				elem = newReadQueueElem(conn)
+				select {
+				case openQueue <- elem:
+					elem = newReadQueueElem(conn)
+				case <-conn.done:
+					// Delivery owns the element, but no decrypt worker received it.
+					elem.Unlock()
+					elem = nil
+					return
+				}
+			case <-conn.done:
+				elem.Unlock()
+				return
 			default:
 				elem.Unlock()
 			}
@@ -154,8 +188,7 @@ func newWriteQueueElem(chunks [][]byte, peer *peer) *writeQueueElem {
 	m := header.TransportDataMessage(buf.Bytes())
 	n := 0
 	for _, chunk := range chunks {
-		nn := copy(m.Packet()[n:], chunk)
-		n += nn
+		n += copy(m.Packet()[n:], chunk)
 	}
 
 	elem.peer = &peerWriter{
@@ -163,7 +196,6 @@ func newWriteQueueElem(chunks [][]byte, peer *peer) *writeQueueElem {
 		peer:  peer,
 		start: time.Now(),
 	}
-
 	return elem
 }
 
@@ -185,8 +217,9 @@ type writeQueue struct {
 }
 
 type sendQueue struct {
-	mu       sync.RWMutex
-	isClosed bool
+	mu        sync.RWMutex
+	closeOnce sync.Once
+	done      chan struct{}
 	*writeQueue
 	deliveryQueue chan *writeQueueElem
 }
@@ -194,6 +227,7 @@ type sendQueue struct {
 func (wq *writeQueue) newSendQueue(size int) *sendQueue {
 	sq := &sendQueue{
 		writeQueue:    wq,
+		done:          make(chan struct{}),
 		deliveryQueue: make(chan *writeQueueElem, size),
 	}
 	go func() {
@@ -201,8 +235,13 @@ func (wq *writeQueue) newSendQueue(size int) *sendQueue {
 			elem.Lock()
 			//lint:ignore SA2001 Lock to wait for encryption.
 			elem.Unlock()
-			if elem.sealed != nil {
-				elem.peer.send(elem.sealed, elem.addr)
+			select {
+			case <-sq.done:
+			case <-sq.closed:
+			default:
+				if elem.sealed != nil {
+					elem.peer.send(elem.sealed, elem.addr)
+				}
 			}
 			elem.Release()
 		}
@@ -211,23 +250,41 @@ func (wq *writeQueue) newSendQueue(size int) *sendQueue {
 }
 
 func (sq *sendQueue) Close() {
-	sq.mu.Lock()
-	defer sq.mu.Unlock()
-	if !sq.isClosed {
-		sq.isClosed = true
+	sq.closeOnce.Do(func() {
+		close(sq.done)
+		sq.mu.Lock()
+		defer sq.mu.Unlock()
 		close(sq.deliveryQueue)
+	})
+}
+
+// Retiring a peer queue does not close the connection. A connection-wide
+// shutdown takes precedence when both queues have been closed.
+func (sq *sendQueue) closedError(peer *peer) error {
+	select {
+	case <-sq.closed:
+		return net.ErrClosed
+	default:
 	}
+	if peer.evicted.AtomicRead() {
+		return ErrPeerBlocked
+	}
+	return net.ErrClosed
 }
 
 func (sq *sendQueue) enqueueChunks(chunks [][]byte, peer *peer) (int, error) {
 	sq.mu.RLock()
 	defer sq.mu.RUnlock()
-	if sq.isClosed {
-		return 0, net.ErrClosed
+	select {
+	case <-sq.done:
+		return 0, sq.closedError(peer)
+	default:
 	}
 	sq.writeQueue.mu.RLock()
 	defer sq.writeQueue.mu.RUnlock()
 	select {
+	case <-sq.done:
+		return 0, sq.closedError(peer)
 	case <-sq.closed:
 		return 0, net.ErrClosed
 	default:
@@ -236,20 +293,34 @@ func (sq *sendQueue) enqueueChunks(chunks [][]byte, peer *peer) (int, error) {
 	if peer.IsBlocked() {
 		return 0, ErrPeerBlocked
 	}
+	remaining := MaximumDataSize
+	for _, chunk := range chunks {
+		if len(chunk) > remaining {
+			return 0, ErrMessageTooLarge
+		}
+		remaining -= len(chunk)
+	}
 	elem := newWriteQueueElem(chunks, peer)
 	elem.Lock()
-	// the length must be read before the elem is sent to the queue.
+	// Read the length before the element is transferred to the queue.
 	n := len(elem.peer.data)
 	select {
 	case sq.deliveryQueue <- elem:
 		select {
 		case sq.sealQueue <- elem:
 			return n, nil
+		case <-sq.done:
+			elem.Unlock()
+			return 0, sq.closedError(peer)
 		case <-sq.closed:
 			// The delivery worker owns the queued buffer and releases it.
 			elem.Unlock()
 			return 0, net.ErrClosed
 		}
+	case <-sq.done:
+		elem.Unlock()
+		elem.Release()
+		return 0, sq.closedError(peer)
 	case <-sq.closed:
 		elem.Unlock()
 		elem.Release()

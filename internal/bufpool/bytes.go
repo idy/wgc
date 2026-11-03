@@ -3,9 +3,19 @@
 
 package bufpool
 
-import "gvisor.dev/gvisor/pkg/buffer"
+import (
+	"sync"
+
+	"gvisor.dev/gvisor/pkg/buffer"
+)
 
 const DefaultSize = buffer.MaxChunkSize
+
+// Views are exclusively owned and never cloned. Retaining a normal view avoids
+// gVisor clearing its entire chunk when it is acquired again.
+var defaultViews = sync.Pool{
+	New: func() any { return buffer.NewViewSize(DefaultSize) },
+}
 
 type bytes struct {
 	view *buffer.View
@@ -24,9 +34,15 @@ func (b *bytes) BytesN(n int) []byte {
 }
 
 func get() *bytes {
-	return &bytes{buffer.NewViewSize(DefaultSize)}
+	return &bytes{view: defaultViews.Get().(*buffer.View)}
 }
 
 func put(b *bytes) {
-	b.view.Release()
+	view := b.view
+	b.view = nil
+	if view.Size() == DefaultSize && view.Capacity() == DefaultSize {
+		defaultViews.Put(view)
+	} else {
+		view.Release()
+	}
 }

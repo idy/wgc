@@ -49,14 +49,21 @@ func (hi *handshakeInitiation) Open() ([]byte, bool) {
 		hi.logV(3).Printf("Peer not found: %v", result.peerStaticPub)
 		return nil, false
 	}
-	if p.blocked.AtomicRead() {
-		hi.logV(3).Print("Peer is blocked")
+	// Serialize freshness updates with the peer's eventual session commit.
+	// An older worker must not replace a newer accepted initiation.
+	p.Lock()
+	if p.evicted.Read() || p.blocked.Read() {
+		p.Unlock()
+		hi.logV(3).Print("Peer is blocked or evicted")
 		return nil, false
 	}
-	if !p.handshakeTimestampFilter.Filter(&result.time) {
-		hi.logV(3).Print("A newer initiation is received")
+	fresh := p.handshakeTimestampFilter.Filter(&result.time)
+	p.Unlock()
+	if !fresh {
+		hi.logV(3).Print("An equal or newer initiation was already received")
 		return nil, false
 	}
+	hi.initiationTime = result.time
 	var esk, epk Key
 	if err := utils.DHGenerate(&esk, &epk); err != nil {
 		hi.logV(1).Printf("DHGenerate error: %v", err)
@@ -65,8 +72,6 @@ func (hi *handshakeInitiation) Open() ([]byte, bool) {
 	resp := header.HandshakeResponseMessage(hi.buf.BytesN(header.HandshakeResponseSize))
 	err = hh.SetEmpty(
 		resp,
-		hi.conn.staticPriv,
-		hi.conn.staticPub,
 		&esk,
 		&epk,
 		&result.peerStaticPub,

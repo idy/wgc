@@ -32,6 +32,10 @@ func (td *transportData) Open() ([]byte, bool) {
 		return nil, false
 	case confirmed, responded:
 	}
+	if td.time.Sub(ss.establishTime) >= rejectAfterTime {
+		td.logV(3).Print("Session outdated")
+		return nil, false
+	}
 	m := td.msg()
 	m.SetReceiver(0)
 
@@ -56,12 +60,5 @@ func (td *transportData) Open() ([]byte, bool) {
 	if !valid {
 		return nil, false
 	}
-	if td.time.Sub(ss.establishTime) > rejectAfterTime {
-		td.logV(3).Print("Session outdated, treat this transport data as a keepalive message")
-		return nil, true
-	}
-	if len(b) > 0 {
-		return b, true
-	}
-	return nil, true
+	return b, true
 }
