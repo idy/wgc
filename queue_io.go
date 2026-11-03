@@ -258,19 +258,33 @@ func (sq *sendQueue) Close() {
 	})
 }
 
+// Retiring a peer queue does not close the connection. A connection-wide
+// shutdown takes precedence when both queues have been closed.
+func (sq *sendQueue) closedError(peer *peer) error {
+	select {
+	case <-sq.closed:
+		return net.ErrClosed
+	default:
+	}
+	if peer.evicted.AtomicRead() {
+		return ErrPeerBlocked
+	}
+	return net.ErrClosed
+}
+
 func (sq *sendQueue) enqueueChunks(chunks [][]byte, peer *peer) (int, error) {
 	sq.mu.RLock()
 	defer sq.mu.RUnlock()
 	select {
 	case <-sq.done:
-		return 0, net.ErrClosed
+		return 0, sq.closedError(peer)
 	default:
 	}
 	sq.writeQueue.mu.RLock()
 	defer sq.writeQueue.mu.RUnlock()
 	select {
 	case <-sq.done:
-		return 0, net.ErrClosed
+		return 0, sq.closedError(peer)
 	case <-sq.closed:
 		return 0, net.ErrClosed
 	default:
@@ -297,7 +311,7 @@ func (sq *sendQueue) enqueueChunks(chunks [][]byte, peer *peer) (int, error) {
 			return n, nil
 		case <-sq.done:
 			elem.Unlock()
-			return 0, net.ErrClosed
+			return 0, sq.closedError(peer)
 		case <-sq.closed:
 			// The delivery worker owns the queued buffer and releases it.
 			elem.Unlock()
@@ -306,7 +320,7 @@ func (sq *sendQueue) enqueueChunks(chunks [][]byte, peer *peer) (int, error) {
 	case <-sq.done:
 		elem.Unlock()
 		elem.Release()
-		return 0, net.ErrClosed
+		return 0, sq.closedError(peer)
 	case <-sq.closed:
 		elem.Unlock()
 		elem.Release()

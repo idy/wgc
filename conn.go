@@ -417,7 +417,8 @@ func (conn *Conn) PrivateKey() Key {
 // admission, not transmission or delivery. Encryption and sending happen in the
 // background; a message can trigger a handshake and be discarded while no
 // session is available. Applications must implement retries or acknowledgements
-// when delivery matters.
+// when delivery matters. A peer evicted during admission returns ErrPeerBlocked;
+// the connection remains usable and the application may retry with a new peer.
 func (conn *Conn) WriteTo(b []byte, staticPubKey Key) (int, Peer, error) {
 	p, ok := conn.peer(staticPubKey)
 	if !ok {
@@ -429,9 +430,13 @@ func (conn *Conn) WriteTo(b []byte, staticPubKey Key) (int, Peer, error) {
 			queue = value.(*sendQueue)
 		} else {
 			conn.mu.Lock()
-			if conn.closed || p.evicted.AtomicRead() {
+			if conn.closed {
 				conn.mu.Unlock()
 				return 0, nil, errConnClosed
+			}
+			if p.evicted.AtomicRead() {
+				conn.mu.Unlock()
+				return 0, nil, ErrPeerBlocked
 			}
 			if value, loaded := conn.autoWriters.Load(p); loaded {
 				queue = value.(*sendQueue)
