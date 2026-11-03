@@ -26,7 +26,7 @@ func (s secureSessionState) String() string {
 	case initiated:
 		return "initiated"
 	case responded:
-		return "responsed"
+		return "responded"
 	case confirmed:
 		return "confirmed"
 	}
@@ -35,7 +35,6 @@ func (s secureSessionState) String() string {
 
 type sessionSnapshot struct {
 	isInitiator   bool
-	sender        uint32
 	receiver      uint32
 	sendCount     uint64
 	recvCipher    cipher.AEAD
@@ -43,11 +42,11 @@ type sessionSnapshot struct {
 	establishTime time.Time
 	state         secureSessionState
 
-	hash     *[blake2s.Size]byte
-	chainKey *Key
+	hash          *[blake2s.Size]byte
+	chainKey      *Key
+	ephemeralPriv *Key
 
 	lastRecvTime time.Time
-	lastSentTime time.Time
 }
 
 type secureSession struct {
@@ -67,9 +66,6 @@ type secureSession struct {
 	receiver uint32
 
 	// +checklocks:mu
-	peerEphemeralPub *Key
-
-	// +checklocks:mu
 	hash *[blake2s.Size]byte
 
 	// +checklocks:mu
@@ -77,9 +73,6 @@ type secureSession struct {
 
 	// +checklocks:mu
 	ephemeralPriv *Key
-
-	// +checklocks:mu
-	ephemeralPub *Key
 
 	// +checklocks:mu
 	sendCount uint64
@@ -96,10 +89,7 @@ type secureSession struct {
 	// +checklocks:mu
 	lastRecvTime time.Time
 
-	// +checklocks:mu
-	lastSentTime time.Time
-
-	// mac1 stores the mac1 used to calculate the last cookie repley message.
+	// mac1 stores the mac1 used to calculate the last cookie reply message.
 	// It's used to verify the mac2 of subsequent received messages.
 	// +checklocks:mu
 	mac1 [header.CookieSize]byte
@@ -142,37 +132,35 @@ func (s *secureSession) state() (_ secureSessionState) {
 	return confirmed
 }
 
-func (s *secureSession) TxSnapshot(t time.Time) *sessionSnapshot {
+func (s *secureSession) TxSnapshot() sessionSnapshot {
 	s.Lock()
 	defer s.Unlock()
 	snap := s.snapshot()
 	if s.sendCount <= rejectAfterMessages {
 		s.sendCount += 1
 	}
-	s.lastSentTime = t
 	return snap
 }
 
-func (s *secureSession) Snapshot() *sessionSnapshot {
+func (s *secureSession) Snapshot() sessionSnapshot {
 	s.RLock()
 	defer s.RUnlock()
 	return s.snapshot()
 }
 
 // +checklocksread:s.mu
-func (s *secureSession) snapshot() *sessionSnapshot {
-	ss := new(sessionSnapshot)
-	ss.isInitiator = s.isInitiator
-	ss.sender = s.sender
-	ss.receiver = s.receiver
-	ss.sendCount = s.sendCount
-	ss.sendCipher = s.sendCipher
-	ss.recvCipher = s.recvCipher
-	ss.state = s.state()
-	ss.establishTime = s.establishTime
-	ss.lastRecvTime = s.lastRecvTime
-	ss.lastSentTime = s.lastSentTime
-	ss.hash = s.hash
-	ss.chainKey = s.chainKey
-	return ss
+func (s *secureSession) snapshot() sessionSnapshot {
+	return sessionSnapshot{
+		isInitiator:   s.isInitiator,
+		receiver:      s.receiver,
+		sendCount:     s.sendCount,
+		sendCipher:    s.sendCipher,
+		recvCipher:    s.recvCipher,
+		state:         s.state(),
+		establishTime: s.establishTime,
+		lastRecvTime:  s.lastRecvTime,
+		hash:          s.hash,
+		chainKey:      s.chainKey,
+		ephemeralPriv: s.ephemeralPriv,
+	}
 }

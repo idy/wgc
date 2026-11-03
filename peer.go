@@ -8,6 +8,7 @@ import (
 
 	"github.com/idy/wgc/internal/bufpool"
 	"github.com/idy/wgc/internal/header"
+	"github.com/idy/wgc/internal/netutil"
 	"github.com/idy/wgc/internal/utils"
 )
 
@@ -54,6 +55,11 @@ type peer struct {
 
 	// +checklocks:mu
 	handshake *secureSession
+
+	// handshakePending coalesces requests before the initiation goroutine has
+	// acquired the connection locks and published its handshake session.
+	// +checklocks:mu
+	handshakePending bool
 
 	handshakeTimestampFilter timestampFilter
 
@@ -119,25 +125,19 @@ type peer struct {
 	// +checklocks:mu
 	cookie [header.CookieSize]byte
 
-	// If setZeroTimer is true, it means that there is a running go routine
-	// waiting to execute peer.SetZeroTimerFunc.
+	// Timers are created, rearmed, and stopped while holding mu. A callback
+	// that has already started must check evicted under the same lock.
 	// +checklocks:mu
-	setZeroTimer bool
+	setZeroTimer *time.Timer
 
-	// If zeroCookieTimer is true, it means that there is a running go routine
-	// waiting to execute peer.ZeroCookieTimerFunc.
 	// +checklocks:mu
-	zeroCookieTimer bool
+	zeroCookieTimer *time.Timer
 
-	// If passiveKeepaliveTimer is true, it means that there is a running go
-	// routine waiting to execute peer.PassiveKeepaliveTimerFunc.
 	// +checklocks:mu
-	passiveKeepaliveTimer bool
+	passiveKeepaliveTimer *time.Timer
 
-	// If passiveHandshakeTimer is true, it means that there is a running go
-	// routine waiting to execute peer.PassiveHandshakeTimerFunc.
 	// +checklocks:mu
-	passiveHandshakeTimer bool
+	passiveHandshakeTimer *time.Timer
 
 	// This field is part of conn stats and is used to expose the status of the
 	// peer to external users.
@@ -177,6 +177,9 @@ func (p *peer) Block() bool {
 func (p *peer) Unblock() bool {
 	p.Lock()
 	defer p.Unlock()
+	if p.evicted.Read() {
+		return false
+	}
 	b := p.blocked.Read()
 	p.blocked.SetFalse()
 	return b
@@ -263,24 +266,16 @@ func (p *peer) setMACs(dst []byte) (mac1, mac2 *[header.CookieSize]byte) {
 // converted to a current session or discarded, so this loop does not need to
 // continue).
 func (p *peer) InitiateHandshake() {
-	p.RLock()
-	if p.handshake != nil {
-		p.RUnlock()
-		p.logV(3).Print("A handshake is initiating")
-		return
-	}
-	p.RUnlock()
-
-	// We must ensure the lock order is conn.mu -> conn.stats.mu -> peer.mu,
-	// otherwise we might deadlock.
+	// Keep the lock order conn.mu -> conn.stats.mu -> peer.mu. A queued
+	// request may have become blocked or evicted before acquiring these locks.
 	p.conn.mu.RLock()
 	p.conn.stats.RLock()
 	p.Lock()
-	if p.handshake != nil {
+	p.handshakePending = false
+	if p.conn.closed || p.evicted.Read() || p.blocked.Read() || p.handshakeInitiationDisabled || p.handshake != nil {
 		p.Unlock()
 		p.conn.stats.RUnlock()
 		p.conn.mu.RUnlock()
-		p.logV(3).Print("A handshake is initiating")
 		return
 	}
 	handshake := &secureSession{isInitiator: true, peer: p}
@@ -288,38 +283,45 @@ func (p *peer) InitiateHandshake() {
 		p.Unlock()
 		p.conn.stats.RUnlock()
 		p.conn.mu.RUnlock()
-		p.logV(1).Printf("InitiationHandshake: failed to save session: %v", err)
+		p.logV(1).Printf("InitiateHandshake: failed to save session: %v", err)
 		return
 	}
-
 	p.handshake = handshake
 	p.Unlock()
 	p.conn.stats.RUnlock()
 	p.conn.mu.RUnlock()
+	defer p.discardHandshake(handshake)
+
 	p.logV(3).Print("Start a handshake initiation send loop")
 	var buf [header.HandshakeInitiationSize]byte
-
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	start := time.Now()
 
 	for {
-		if p.blocked.AtomicRead() {
-			p.logV(3).Print("Retransmission stops: peer is blocked")
-			break
-		}
 		now := time.Now()
 		p.RLock()
 		s, a, t := p.handshake, p.addr, p.dataWillSend
+		inactive := p.evicted.Read() || p.blocked.Read() || p.handshakeInitiationDisabled
 		p.RUnlock()
+		if inactive || s != handshake {
+			return
+		}
+		// A rekey triggered by the receive path still gets a complete retry
+		// interval even when the last application write was a long time ago.
+		if t.Before(start) {
+			t = start
+		}
 		if now.Sub(t) > rekeyAttemptTime {
 			p.logV(3).Printf("Retransmission stops after %.2f seconds", rekeyAttemptTime.Seconds())
-			break
-		}
-		if s != handshake {
-			p.logV(3).Print("Retransmission stops: handshake is discarded or completed")
 			return
 		}
 		if !a.IsValid() {
-			p.logV(3).Printf("Retransmission: peer has no address")
+			p.logV(3).Print("Retransmission: peer has no address")
 		} else {
 			w := initiationWriter{
 				buf:     buf[:],
@@ -332,30 +334,49 @@ func (p *peer) InitiateHandshake() {
 				w.logV(3).Printf("Retransmission send error: %v", err)
 			}
 		}
-		d := rekeyTimeout + randomJitter()
+		d := rekeyTimeout + netutil.TimeJitter()
 		p.logV(3).Printf("Retransmission sleep %.2f seconds for next round", d.Seconds())
-		time.Sleep(d)
+		if timer == nil {
+			timer = time.NewTimer(d)
+		} else {
+			timer.Reset(d)
+		}
+		select {
+		case <-timer.C:
+		case <-p.conn.done:
+			return
+		}
 	}
-	p.discardHandshake()
 }
 
-func (p *peer) discardHandshake() {
+// requestHandshakeLocked coalesces requests before starting a goroutine, so
+// concurrent packet workers cannot accumulate initiators behind the conn locks.
+// +checklocks:p.mu
+func (p *peer) requestHandshakeLocked() {
+	if p.evicted.Read() || p.blocked.Read() || p.handshakeInitiationDisabled || p.handshake != nil || p.handshakePending {
+		return
+	}
+	p.handshakePending = true
+	go p.InitiateHandshake()
+}
+
+func (p *peer) discardHandshake(expected *secureSession) {
 	p.Lock()
 	defer p.Unlock()
-	if p.handshake != nil {
-		go p.conn.deleteSession(p.handshake)
+	if expected != nil && p.handshake == expected {
+		go p.conn.deleteSession(expected)
 		p.handshake = nil
 	}
 }
 
 // +checklocks:p.mu
 func (p *peer) startPassiveHandshakeTimer() {
-	if !p.passiveHandshakeTimer {
+	if p.evicted.Read() || p.blocked.Read() || p.handshakeInitiationDisabled {
+		return
+	}
+	if p.passiveHandshakeTimer == nil {
 		p.logV(3).Print("PassiveHandshake: timer started")
-		p.passiveHandshakeTimer = true
-		time.AfterFunc(rekeyAfterTime+keepaliveTimeout, p.PassiveHandshakeTimerFunc)
-	} else {
-		p.logV(3).Print("PassiveHandshake: timer existed")
+		p.passiveHandshakeTimer = time.AfterFunc(rekeyTimeout+keepaliveTimeout, p.PassiveHandshakeTimerFunc)
 	}
 }
 
@@ -365,53 +386,25 @@ func (p *peer) startPassiveHandshakeTimer() {
 // a new handshake is initiated; otherwise, the timer trigger time is postponed
 // as needed.
 func (p *peer) PassiveHandshakeTimerFunc() {
-	p.logV(3).Print("PassiveHandshake triggered")
-	if p.blocked.AtomicRead() {
-		p.logV(3).Print("PassiveHandshake stops: peer is blocked")
-		p.Lock()
-		defer p.Unlock()
-		p.passiveHandshakeTimer = false
-		return
-	}
-
-	p.RLock()
-	recv := maxTime([]time.Time{p.dataRecv, p.keepaliveRecv, p.handshakeRecv})
-	sent := p.dataSent
-	firstSent := p.firstDataSentAfterRecv
-	p.RUnlock()
-
-	// 6.5 Passive Keepalive
-	//
-	// we can determine if the secure session is broken or disconnected if a
-	// transport data message has not been received for (Keepalive-Timeout +
-	// Rekey-Timeout) seconds.
-	//
-	// When this function is triggered, if the receiving time is later than the
-	// sending time, it means that the secure session is kept in an active state
-	// and there is no need to initiate a new handshake.
-	skip := recv.After(sent)
-	if !skip {
-		// If the duration of the current time from firstSent is less than
-		// (Rekey-Timeout + Keepalive - Timeout), the timer should be postponed.
-		//
-		// Data Sent (which start this timer) --> Auth Recv --> Data Sent
-		// (another)
-		if d := rekeyTimeout + keepaliveTimeout - time.Since(firstSent); d > 0 {
-			p.logV(3).Printf("PassiveHandshake postponed for %.2f seconds", d.Seconds())
-			time.AfterFunc(d, p.PassiveHandshakeTimerFunc)
-			return
-		}
-	}
-
 	p.Lock()
 	defer p.Unlock()
-	p.passiveHandshakeTimer = false
-	if skip {
-		p.logV(3).Print("PassiveHandshake skip")
+	if p.evicted.Read() || p.blocked.Read() || p.handshakeInitiationDisabled {
+		p.passiveHandshakeTimer = nil
 		return
 	}
-	p.logV(3).Print("PassiveHandshake try to initiate handshake")
-	go p.InitiateHandshake()
+	recv := maxTime([]time.Time{p.dataRecv, p.keepaliveRecv, p.handshakeRecv})
+	if recv.After(p.dataSent) {
+		p.passiveHandshakeTimer = nil
+		return
+	}
+	// Receiving an authenticated reply and then sending another data packet
+	// moves the recovery deadline to that first subsequent send.
+	if d := rekeyTimeout + keepaliveTimeout - time.Since(p.firstDataSentAfterRecv); d > 0 {
+		p.passiveHandshakeTimer = time.AfterFunc(d, p.PassiveHandshakeTimerFunc)
+		return
+	}
+	p.passiveHandshakeTimer = nil
+	p.requestHandshakeLocked()
 }
 
 // startPassiveKeepaliveTimer starts a timer to send a keepalive message after
@@ -422,119 +415,91 @@ func (p *peer) PassiveHandshakeTimerFunc() {
 // inner-packet.
 // +checklocks:p.mu
 func (p *peer) startPassiveKeepaliveTimer() {
-	if !p.passiveKeepaliveTimer {
+	if p.evicted.Read() || p.blocked.Read() {
+		return
+	}
+	if p.passiveKeepaliveTimer == nil {
 		p.logV(3).Print("PassiveKeepalive: timer started")
-		p.passiveKeepaliveTimer = true
-		time.AfterFunc(keepaliveTimeout, p.PassiveKeepaliveTimerFunc)
-	} else {
-		p.logV(3).Print("PassiveKeepalive: timer existed")
+		p.passiveKeepaliveTimer = time.AfterFunc(keepaliveTimeout, p.PassiveKeepaliveTimerFunc)
 	}
 }
 
 func (p *peer) PassiveKeepaliveTimerFunc() {
-	p.logV(3).Print("PassiveKeepalive triggered")
-	if p.blocked.AtomicRead() {
-		p.logV(3).Print("PassiveKeepalive stops: peer is blocked")
-		p.Lock()
-		defer p.Unlock()
-		p.passiveKeepaliveTimer = false
-		return
-	}
-	p.RLock()
-	sent := maxTime([]time.Time{p.dataSent, p.keepaliveSent, p.handshakeSent})
-	recv := p.dataRecv
-	firstRecv := p.firstDataRecvAfterSent
-	p.RUnlock()
-
-	skip := sent.After(recv)
-	if !skip {
-		if d := keepaliveTimeout - time.Since(firstRecv); d > 0 {
-			p.logV(3).Printf("PassiveKeepalive postponed for %.2f seconds", d.Seconds())
-			time.AfterFunc(d, p.PassiveKeepaliveTimerFunc)
-			return
-		}
-	}
-
 	p.Lock()
-	p.passiveKeepaliveTimer = false
-	p.Unlock()
-	if skip {
-		p.logV(3).Print("PassiveKeepalive skip")
+	if p.evicted.Read() || p.blocked.Read() {
+		p.passiveKeepaliveTimer = nil
+		p.Unlock()
 		return
 	}
-	p.logV(3).Print("PassiveKeepalive try to send keepalive message")
+	sent := maxTime([]time.Time{p.dataSent, p.keepaliveSent, p.handshakeSent})
+	if sent.After(p.dataRecv) {
+		p.passiveKeepaliveTimer = nil
+		p.Unlock()
+		return
+	}
+	if d := keepaliveTimeout - time.Since(p.firstDataRecvAfterSent); d > 0 {
+		p.passiveKeepaliveTimer = time.AfterFunc(d, p.PassiveKeepaliveTimerFunc)
+		p.Unlock()
+		return
+	}
+	p.passiveKeepaliveTimer = nil
+	p.Unlock()
 	p.writeImmediately(nil)
 }
 
 // +checklocks:p.mu
 func (p *peer) startZeroCookieTimer() {
-	if !p.zeroCookieTimer {
+	if p.evicted.Read() || p.blocked.Read() {
+		return
+	}
+	if p.zeroCookieTimer == nil {
 		p.logV(3).Print("ZeroCookie: timer started")
-		p.zeroCookieTimer = true
-		time.AfterFunc(cookieSecretRotationDuration, p.ZeroCookieTimerFunc)
-	} else {
-		p.logV(3).Print("ZeroCookie: timer existed")
+		p.zeroCookieTimer = time.AfterFunc(cookieSecretRotationDuration, p.ZeroCookieTimerFunc)
 	}
 }
 
 func (p *peer) ZeroCookieTimerFunc() {
-	p.logV(3).Print("ZeroCookie triggered")
-	if p.blocked.AtomicRead() {
-		p.logV(3).Print("ZeroCookie stops: peer is blocked")
-		p.Lock()
-		defer p.Unlock()
-		p.zeroCookieTimer = false
-		return
-	}
-	p.RLock()
-	d := cookieSecretRotationDuration - time.Since(p.cookieReplyRecv)
-	p.RUnlock()
-
-	if d > 0 {
-		p.logV(3).Printf("ZeroCookie postponed for %.2f seconds", d.Seconds())
-		// When the function is triggered, a new cookie reply is received, so
-		// the current cookie is still valid, and the timer can be postponed.
-		time.AfterFunc(d, p.ZeroCookieTimerFunc)
-		return
-	}
-
 	p.Lock()
 	defer p.Unlock()
-	p.zeroCookieTimer = false
-	copy(p.cookie[:], zeroBytes)
-	p.logV(3).Print("ZeroCookie: OK")
+	if p.evicted.Read() || p.blocked.Read() {
+		p.zeroCookieTimer = nil
+		return
+	}
+	if d := cookieSecretRotationDuration - time.Since(p.cookieReplyRecv); d > 0 {
+		p.zeroCookieTimer = time.AfterFunc(d, p.ZeroCookieTimerFunc)
+		return
+	}
+	p.zeroCookieTimer = nil
+	clear(p.cookie[:])
 }
 
 // +checklocks:p.mu
 func (p *peer) startSetZeroTimer() {
-	if !p.setZeroTimer {
+	if p.evicted.Read() || p.blocked.Read() {
+		return
+	}
+	if p.setZeroTimer == nil {
 		p.logV(3).Print("SetZero: timer started")
-		p.setZeroTimer = true
-		time.AfterFunc(3*rejectAfterTime, p.SetZeroTimerFunc)
-	} else {
-		p.logV(3).Print("SetZero: timer existed")
+		p.setZeroTimer = time.AfterFunc(3*rejectAfterTime, p.SetZeroTimerFunc)
 	}
 }
 
 func (p *peer) SetZeroTimerFunc() {
-	p.logV(3).Print("SetZero triggered")
-	if p.blocked.AtomicRead() {
-		p.logV(3).Print("SetZero stops: peer is blocked")
-		p.Lock()
-		defer p.Unlock()
-		p.setZeroTimer = false
+	p.Lock()
+	if p.evicted.Read() || p.blocked.Read() {
+		p.setZeroTimer = nil
+		p.Unlock()
 		return
 	}
-	p.RLock()
 	t := maxTime([]time.Time{p.handshakeSent, p.handshakeRecv})
-	p.RUnlock()
-
-	d := 3*rejectAfterTime - time.Since(t)
-	if d > 0 {
-		p.logV(3).Printf("SetZero postponed for %.2f seconds", d.Seconds())
-		time.AfterFunc(d, p.SetZeroTimerFunc)
+	if d := 3*rejectAfterTime - time.Since(t); d > 0 {
+		p.setZeroTimer = time.AfterFunc(d, p.SetZeroTimerFunc)
+		p.Unlock()
 		return
 	}
+	p.setZeroTimer = nil
+	p.Unlock()
+	// Eviction acquires conn.mu before peer.mu.
 	p.conn.evictPeer(p)
 	p.logV(3).Print("Peer is zeroed and evicted")
 }
@@ -542,7 +507,19 @@ func (p *peer) SetZeroTimerFunc() {
 func (p *peer) SetZero() []*secureSession {
 	p.Lock()
 	defer p.Unlock()
-	copy(p.cookie[:], zeroBytes)
+	p.blocked.SetTrue()
+	p.evicted.SetTrue()
+	p.handshakePending = false
+	for _, timer := range []*time.Timer{p.setZeroTimer, p.zeroCookieTimer, p.passiveKeepaliveTimer, p.passiveHandshakeTimer} {
+		if timer != nil {
+			timer.Stop()
+		}
+	}
+	p.setZeroTimer = nil
+	p.zeroCookieTimer = nil
+	p.passiveKeepaliveTimer = nil
+	p.passiveHandshakeTimer = nil
+	clear(p.cookie[:])
 	ss := make([]*secureSession, 0, 4)
 	if p.next != nil {
 		ss = append(ss, p.next)

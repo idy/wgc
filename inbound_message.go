@@ -10,6 +10,7 @@ import (
 
 	"github.com/idy/wgc/internal/bufpool"
 	"github.com/idy/wgc/internal/header"
+	"github.com/idy/wgc/internal/tai64"
 	"github.com/idy/wgc/internal/utils"
 )
 
@@ -23,7 +24,8 @@ type inboundMessage struct {
 	conn *Conn
 	time time.Time
 
-	cookieSecret [32]byte
+	cookieSecret   [32]byte
+	initiationTime tai64.NanoTime
 
 	buf  *bufpool.Buffer
 	data []byte
@@ -37,6 +39,7 @@ func (msg *inboundMessage) setZero() {
 	msg.conn = nil
 	msg.time = time.Time{}
 	copy(msg.cookieSecret[:], zeroBytes)
+	msg.initiationTime = tai64.NanoTime{}
 	msg.buf = nil
 	msg.data = nil
 	msg.addr = netip.AddrPort{}
@@ -116,6 +119,7 @@ func (msg *inboundMessage) Read() error {
 	msg.addr = addr
 	msg.typ = 0
 	msg.session = nil
+	msg.initiationTime = tai64.NanoTime{}
 	return nil
 }
 

@@ -40,34 +40,3 @@ func (msg HandshakeResponseMessage) SetEphemeral(v []byte) {
 func (msg HandshakeResponseMessage) Empty() *[aeadTagSize]byte {
 	return (*[aeadTagSize]byte)(msg[44:])
 }
-
-func (msg HandshakeResponseMessage) SetEmpty(tag []byte) {
-	b := msg[44:]
-	copy(b[:aeadTagSize], tag)
-}
-
-func (msg HandshakeResponseMessage) MAC1Prior() *[60]byte {
-	return (*[60]byte)(msg)
-}
-
-func (msg HandshakeResponseMessage) MAC1() *[CookieSize]byte {
-	return (*[CookieSize]byte)(msg[60:])
-}
-
-func (msg HandshakeResponseMessage) SetMAC1(v []byte) {
-	b := msg[60:]
-	copy(b[:CookieSize], v)
-}
-
-func (msg HandshakeResponseMessage) MAC2Prior() *[76]byte {
-	return (*[76]byte)(msg)
-}
-
-func (msg HandshakeResponseMessage) MAC2() *[CookieSize]byte {
-	return (*[CookieSize]byte)(msg[76:])
-}
-
-func (msg HandshakeResponseMessage) SetMAC2(v []byte) {
-	b := msg[76:]
-	copy(b[:CookieSize], v)
-}

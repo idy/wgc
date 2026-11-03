@@ -1,4 +1,4 @@
-package transport_test
+package integration_test
 
 import (
 	"bytes"
@@ -8,26 +8,14 @@ import (
 	"time"
 
 	wireguard "github.com/idy/wgc"
+	"github.com/idy/wgc/tests/internal/testutil"
 	"github.com/idy/wgc/transport"
 )
 
 var _ wireguard.Transport = (*transport.UDPConn)(nil)
 
-func listenUDP(t *testing.T) *net.UDPConn {
-	t.Helper()
-	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { socket.Close() })
-	if err := socket.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	return socket
-}
-
 func TestUDPConnRoundTrip(t *testing.T) {
-	left, right := listenUDP(t), listenUDP(t)
+	left, right := testutil.ListenUDP(t), testutil.ListenUDP(t)
 	for _, pair := range [][2]*net.UDPConn{{left, right}, {right, left}} {
 		sender, receiver := transport.FromUDPConn(pair[0]), transport.FromUDPConn(pair[1])
 		payload := []byte("wgc UDP adapter")
@@ -48,7 +36,7 @@ func TestUDPConnRoundTrip(t *testing.T) {
 }
 
 func TestUDPConnCloseUnblocksRead(t *testing.T) {
-	adapter := transport.FromUDPConn(listenUDP(t))
+	adapter := transport.FromUDPConn(testutil.ListenUDP(t))
 	started := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {

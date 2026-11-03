@@ -141,8 +141,6 @@ func (tc *handshakeTestCase) Run(t testing.TB) {
 	hsr.SetEphemeral(tc.repk[:])
 	err = rh.SetEmpty(
 		hsr,
-		&tc.rssk,
-		&tc.rspk,
 		&tc.resk,
 		&tc.repk,
 		&tc.ispk,

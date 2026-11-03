@@ -41,7 +41,7 @@ func (w *peerWriter) seal(dst []byte) ([]byte, netip.AddrPort, error) {
 		}
 	}
 	w.time = time.Now()
-	ss := curSession.TxSnapshot(w.time)
+	ss := curSession.TxSnapshot()
 	if w.time.Sub(ss.establishTime) > rejectAfterTime || ss.sendCount > rejectAfterMessages {
 		w.logV(3).Print("Session outdated")
 		return nil, netip.AddrPort{}, &ioError{
@@ -113,13 +113,14 @@ func (w *initiationWriter) Write() error {
 	peer.RUnlock()
 
 	w.session.Lock()
-	if w.session.state() == initiated {
-		w.session.mac1 = *mac1
-		w.session.hash = &h
-		w.session.chainKey = &ck
-		w.session.ephemeralPriv = &sk
-		w.session.ephemeralPub = &pk
+	if w.session.state() != initiated {
+		w.session.Unlock()
+		return nil
 	}
+	w.session.mac1 = *mac1
+	w.session.hash = &h
+	w.session.chainKey = &ck
+	w.session.ephemeralPriv = &sk
 	w.session.Unlock()
 	if _, err := peer.conn.transport.WriteTo(msg, addr); err != nil {
 		w.logV(2).Printf("Send error: %v", err)
