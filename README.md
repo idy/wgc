@@ -181,6 +181,24 @@ Key files:
 - `tests/`: public integration tests, regressions, benchmarks, and shared fixtures.
 - `site/`: the static project page, published to `wgc.idy.dev` by GitHub Pages.
 
+## Website development
+
+The static website lives in `site/` and needs no build step or package dependencies.
+Preview it from the repository root with `python3 -m http.server 8080 --directory site`.
+`index.html` provides the complete English fallback; `script.js` adds Chinese
+translations, copy feedback, and live release information. `styles.css` contains
+the project layout and explicit light/dark color tokens.
+
+`site/shared/` contains the common idy.dev header/footer styles, preference and
+release helpers, and the locally hosted Manrope font with its OFL license. Keep
+these files identical across the idy.dev sites. Language follows the browser and
+theme follows the system by default; the header selectors save manual choices in
+local storage. GitHub's public Releases API supplies the current version and source
+archive URL. WGC is installed as a Go module, not a prebuilt binary. If the API is
+unavailable, the page retains the Releases and API reference links without claiming
+a cached or pinned latest version. Validate both languages and themes, narrow
+screens, copy actions, and API failure behavior when changing the page.
+
 ## License
 
 WGC is available under the [MIT License](LICENSE). Third-party code and modules
