@@ -13,8 +13,14 @@
   --button-hover: #103c69;
   --selection: #c8e4ec;
   --panel: #0b6362;
-  --font: "Manrope", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font: var(--idy-font);
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+/* Retain the existing local fallback after the shared typography is loaded. */
+:root:root {
+  --idy-font: Monda, Manrope, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --idy-heading: Montserrat, Manrope, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --idy-small: Lato, Manrope, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
@@ -116,6 +122,11 @@ pre code { font: inherit; overflow-wrap: normal; }
 .scope p + p { margin-top: 18px; }
 .scope .docs-link { display: inline-block; margin-top: 23px; }
 .trademark { max-width: 1200px; font-size: 11px; color: var(--muted); }
+.idy-footer .idy-home { font-family: var(--idy-heading); }
+.code-note, .trademark { font-family: var(--idy-small); }
+/* Keep the native selects usable in the single row when scripts are unavailable. */
+@media (max-width: 420px) { .idy-header.compact-header .idy-preferences select { width: 62px; padding-inline: 2px; } }
+@media (max-width: 360px) { .idy-header.compact-header .idy-preferences select { width: 54px; } }
 @media (min-width: 1500px) { .hero { gap: 90px; } }
 @media (max-width: 1000px) {
   .wrap { width: calc(100% - 64px); }

@@ -30,6 +30,7 @@
     pageTitle: "WGC — 面向 Go 的 WireGuard 连接库",
     description: "WGC 是一个 Go 库，通过你自己的传输层使用 WireGuard 会话，交换经过身份验证的加密消息。无需 TUN 设备或路由配置。",
     socialDescription: "公钥标识对端，自动管理握手，传输方式由你掌控。",
+    starLabel: "在 GitHub 为 WGC 点星（在新标签页打开）",
     getStarted: "开始使用",
     goReference: "Go API 文档",
     heroTitle: "WireGuard，<br>专注连接层。",

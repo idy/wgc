@@ -190,8 +190,10 @@ translations, copy feedback, and live release information. `styles.css` contains
 the project layout and explicit light/dark color tokens.
 
 `site/shared/` contains the common idy.dev header/footer styles, preference and
-release helpers, and the locally hosted Manrope font with its OFL license. Keep
-these files identical across the idy.dev sites. Language follows the browser and
+release helpers, and locally hosted fonts with their licenses. The compact header
+and page use Montserrat for headings, Monda for body text, Lato for notes, and Phosphor
+icons; Manrope remains a fallback. Keep shared files identical across the idy.dev
+sites. Language follows the browser and
 theme follows the system by default; the header selectors save manual choices in
 local storage. GitHub's public Releases API supplies the current version and source
 archive URL. WGC is installed as a Go module, not a prebuilt binary. If the API is
