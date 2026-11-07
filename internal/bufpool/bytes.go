@@ -3,46 +3,44 @@
 
 package bufpool
 
-import (
-	"sync"
+import "sync"
 
-	"gvisor.dev/gvisor/pkg/buffer"
-)
+// Keep the original maximum message size, including transport header and tag.
+const DefaultSize = 64 << 10
 
-const DefaultSize = buffer.MaxChunkSize
-
-// Views are exclusively owned and never cloned. Retaining a normal view avoids
-// gVisor clearing its entire chunk when it is acquired again.
-var defaultViews = sync.Pool{
-	New: func() any { return buffer.NewViewSize(DefaultSize) },
+// Buffers are exclusively owned. Retain normal storage without clearing it on
+// reuse, and let the GC reclaim exceptional allocations larger than DefaultSize.
+var defaultBuffers = sync.Pool{
+	New: func() any { return &bytes{b: make([]byte, DefaultSize)} },
 }
 
 type bytes struct {
-	view *buffer.View
+	b []byte
 }
 
 func (b *bytes) Bytes() []byte {
-	return b.view.AsSlice()
+	return b.b
 }
 
 func (b *bytes) BytesN(n int) []byte {
-	m := n - b.view.Size()
-	if m > 0 {
-		b.view.Grow(m)
+	if n > cap(b.b) {
+		grown := make([]byte, n)
+		copy(grown, b.b)
+		b.b = grown
+	} else if n > len(b.b) {
+		b.b = b.b[:n]
 	}
-	return b.view.AsSlice()[:n]
+	return b.b[:n]
 }
 
 func get() *bytes {
-	return &bytes{view: defaultViews.Get().(*buffer.View)}
+	return defaultBuffers.Get().(*bytes)
 }
 
 func put(b *bytes) {
-	view := b.view
-	b.view = nil
-	if view.Size() == DefaultSize && view.Capacity() == DefaultSize {
-		defaultViews.Put(view)
+	if len(b.b) == DefaultSize && cap(b.b) == DefaultSize {
+		defaultBuffers.Put(b)
 	} else {
-		view.Release()
+		b.b = nil
 	}
 }

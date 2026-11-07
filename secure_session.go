@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/idy/wgc/internal/header"
+	"github.com/idy/wgc/internal/replay"
 
 	"golang.org/x/crypto/blake2s"
-	"golang.zx2c4.com/wireguard/replay"
 )
 
 type secureSessionState int

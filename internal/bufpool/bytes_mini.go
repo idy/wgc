@@ -29,11 +29,13 @@ func (b *bytes) Bytes() []byte {
 
 func (b *bytes) BytesN(n int) []byte {
 	if n > cap(b.b) {
+		grown := make([]byte, n)
+		copy(grown, b.b)
 		if b.chunk != nil {
 			chunkBuf <- b.chunk
 			b.chunk = nil
 		}
-		b.b = make([]byte, n)
+		b.b = grown
 	}
 	return b.b[:n]
 }
@@ -51,5 +53,7 @@ func get() *bytes {
 func put(b *bytes) {
 	if b.chunk != nil {
 		chunkBuf <- b.chunk
+		b.chunk = nil
 	}
+	b.b = nil
 }

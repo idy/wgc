@@ -165,9 +165,12 @@ benchmarks run when `-bench` is specified.
 
 Tests cover handshake helpers, bounded peer state, concurrent shutdown,
 authenticated transport messages, replay rejection, real encrypted UDP echoes,
-and transport shutdown. `BUFPOOL_MINI` selects a smaller standard-library buffer pool;
-the default pool uses gVisor's buffer implementation. This is the existing pool
-behavior, and the build tag changes `MaximumMessageSize` and `MaximumDataSize`.
+and transport shutdown. The default buffer pool uses Go's `sync.Pool` and retains
+64 KiB byte buffers without clearing them on reuse. `BUFPOOL_MINI` selects a bounded
+pool of 1500-byte chunks. Both implementations preserve bytes when growing and
+discard oversized storage on return. The tag changes `MaximumMessageSize` from
+65536 to 1500 and `MaximumDataSize` from 65504 to 1468; it does not change the wire
+protocol. WGC does not depend on gVisor or a TCP/IP stack.
 
 Key files:
 
