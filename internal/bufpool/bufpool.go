@@ -17,5 +17,7 @@ func Get() *Buffer {
 }
 
 func Put(b *Buffer) {
-	put(b.bytes)
+	storage := b.bytes
+	b.bytes = nil
+	put(storage)
 }

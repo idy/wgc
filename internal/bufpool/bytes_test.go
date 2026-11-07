@@ -1,60 +1,73 @@
-//go:build !BUFPOOL_MINI
-// +build !BUFPOOL_MINI
-
 package bufpool
 
 import (
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 )
 
-func TestDefaultBufferRetainsOwnedView(t *testing.T) {
+func TestBufferReleasesOwnership(t *testing.T) {
 	b := Get()
-	view := b.view
-	if view.Size() != DefaultSize || view.Capacity() != DefaultSize {
-		t.Fatalf("view size/capacity = %d/%d, want %d", view.Size(), view.Capacity(), DefaultSize)
+	data := b.Bytes()
+	if len(data) != DefaultSize || cap(data) != DefaultSize {
+		t.Fatalf("buffer size/capacity = %d/%d, want %d", len(data), cap(data), DefaultSize)
 	}
-	b.Bytes()[0], b.Bytes()[DefaultSize-1] = 17, 29
+	data[0], data[DefaultSize-1] = 17, 29
 	Put(b)
-	if b.view != nil {
-		t.Fatal("returned buffer still owns its pooled view")
+	if b.bytes != nil {
+		t.Fatal("returned buffer still owns its pooled storage")
 	}
-	if view.Size() != DefaultSize || view.Capacity() != DefaultSize {
-		t.Fatal("normal view was released instead of retained")
-	}
-	if view.AsSlice()[0] != 17 || view.AsSlice()[DefaultSize-1] != 29 {
-		t.Fatal("returning a normal view cleared its contents")
+	if data[0] != 17 || data[DefaultSize-1] != 29 {
+		t.Fatal("returning a normal buffer cleared its contents")
 	}
 }
 
-func TestDefaultBufferGrowthAndRelease(t *testing.T) {
+func TestBufferGrowthAndRelease(t *testing.T) {
 	b := Get()
 	b.Bytes()[0], b.Bytes()[DefaultSize-1] = 17, 29
 	if got := b.BytesN(7); len(got) != 7 || len(b.Bytes()) != DefaultSize {
-		t.Fatal("requesting a shorter slice changed the view size")
+		t.Fatal("requesting a shorter slice changed the buffer size")
 	}
 	grown := b.BytesN(DefaultSize + 1)
 	if len(grown) != DefaultSize+1 || grown[0] != 17 || grown[DefaultSize-1] != 29 {
-		t.Fatal("growing the view lost its existing bytes")
+		t.Fatal("growing the buffer lost its existing bytes")
 	}
 	grown[DefaultSize] = 41
 	if got := b.BytesN(DefaultSize + 3); got[DefaultSize] != 41 || len(b.Bytes()) != DefaultSize+3 {
-		t.Fatal("growing the view again lost its contents or size")
+		t.Fatal("growing the buffer again lost its contents or size")
 	}
-	view := b.view
+	storage := b.bytes
 	Put(b)
-	if view.Size() != 0 || b.view != nil {
-		t.Fatal("grown view was retained instead of released")
+	if storage.b != nil || b.bytes != nil {
+		t.Fatal("grown buffer was retained instead of released")
 	}
 	next := Get()
 	defer Put(next)
 	if len(next.Bytes()) != DefaultSize || cap(next.Bytes()) != DefaultSize {
-		t.Fatal("grown view changed the next buffer's default size or capacity")
+		t.Fatal("grown buffer changed the next buffer's default size or capacity")
 	}
 }
 
-func TestDefaultBuffersHaveExclusiveOwnership(t *testing.T) {
+func TestBufferWriteAtAcrossCapacity(t *testing.T) {
+	b := Get()
+	defer Put(b)
+	prefix := make([]byte, DefaultSize)
+	for i := range prefix {
+		prefix[i] = byte(i)
+	}
+	b.Write(prefix)
+	suffix := []byte("continued")
+	if n, err := b.WriteAt(suffix, len(prefix)); err != nil || n != len(suffix) {
+		t.Fatalf("WriteAt = %d, %v", n, err)
+	}
+	want := append(prefix, suffix...)
+	if !slices.Equal(b.Bytes(), want) {
+		t.Fatal("writing beyond the initial capacity lost earlier bytes")
+	}
+}
+
+func TestBuffersHaveExclusiveOwnership(t *testing.T) {
 	var workers sync.WaitGroup
 	for id := range 8 {
 		workers.Add(1)
@@ -80,7 +93,7 @@ func TestDefaultBuffersHaveExclusiveOwnership(t *testing.T) {
 	workers.Wait()
 }
 
-func BenchmarkDefaultBufferGetPut(b *testing.B) {
+func BenchmarkBufferGetPut(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		buf := Get()
