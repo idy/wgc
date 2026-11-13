@@ -96,7 +96,6 @@
     document.querySelector('meta[name="description"]').content = t("description");
     document.querySelector('meta[property="og:title"]').content = t("pageTitle");
     document.querySelector('meta[property="og:description"]').content = t("socialDescription");
-    document.querySelector('meta[name="theme-color"]').content = document.documentElement.dataset.theme === "dark" ? "#111e2b" : "#f2f7fb";
   }
 
   function renderRelease() {
@@ -112,7 +111,6 @@
     status.textContent = copyMessage ? t(copyMessage) : "";
   }
   document.addEventListener("idy:languagechange", renderLanguage);
-  new MutationObserver(renderMetadata).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
   renderLanguage();
 
   function fallbackCopy(text) {
